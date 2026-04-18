@@ -1,6 +1,10 @@
 # m5-paper-buddy
 
 <p align="center">
+  <a href="README.md"><b>中文</b></a> · <a href="README.en.md">English</a>
+</p>
+
+<p align="center">
   <img src="https://github.com/user-attachments/assets/49a543f3-ad1a-4735-a5d1-ef98867cff1e" alt="m5-paper-buddy on an M5Paper V1.1" width="540">
 </p>
 
@@ -13,19 +17,17 @@
   <img src="https://img.shields.io/badge/i18n-EN%20%2F%20中文-lightgrey" alt="i18n">
 </p>
 
-<p align="center"><b>把 M5Paper 变成 Claude Code 的物理桌面搭档</b> · A physical Claude Code companion on M5Paper V1.1</p>
+<p align="center"><b>把 M5Paper 变成 Claude Code 的物理桌面搭档</b></p>
 
 ---
 
-## ✨ 简介 · Intro
+## ✨ 简介
 
 用一块 **M5Paper V1.1**（4.7" 电子墨水屏 / 540×960 / GT911 触摸 / ESP32）做你的 Claude Code 伴侣屏。开着多个 Claude Code 窗口的时候，这块墨水屏会**实时镜像**每个 session 的项目、分支、上下文占用、最新回复和活动日志。Claude 要调用工具时，完整的命令 / diff / 内容会**全屏弹出**等你在**硬件按键**或**触屏**上确认。
 
-A physical Claude Code sidekick: sits on your desk and mirrors every Claude Code window you have open — project, branch, model, context usage, recent activity, Claude's latest reply. When Claude wants to run a tool, the full content shows up as a full-screen approval card with hardware buttons and touch options.
-
 ---
 
-## 🎛️ 功能 · Features
+## 🎛️ 功能
 
 | | |
 | --- | --- |
@@ -41,14 +43,14 @@ A physical Claude Code sidekick: sits on your desk and mirrors every Claude Code
 
 ---
 
-## 🛠️ 硬件 · Hardware
+## 🛠️ 硬件
 
 - **M5Paper V1.1**（4.7" 电子墨水屏、540×960、GT911 电容触摸、ESP32、16MB Flash）
 - 一条 USB-C 线（初次烧录必须，之后可以换 BLE）
 
 ---
 
-## 🚀 快速开始 · Quick start
+## 🚀 快速开始
 
 **前置**：[PlatformIO Core](https://docs.platformio.org/en/latest/core/installation/)、Homebrew（Apple Silicon 下装 `mklittlefs` 用）、一台 M5Paper V1.1。
 
@@ -84,11 +86,11 @@ python3 tools/claude_code_bridge.py --budget 200000
 
 ---
 
-## 📟 日常使用 · Daily use
+## 📟 日常使用
 
 装完以后 Claude Code 里有这几个斜杠命令：
 
-| 命令 Command | 作用 Purpose |
+| 命令 | 作用 |
 | --- | --- |
 | `/buddy-install` | 首次安装 / 重新校验环境 |
 | `/buddy-start` | 启动 daemon（幂等） |
@@ -100,14 +102,14 @@ python3 tools/claude_code_bridge.py --budget 200000
 
 ---
 
-## ⌨️ 控制 · Controls
+## ⌨️ 控制
 
-| 按键 / 区域 Button / zone | Dashboard 状态页 | 审批卡片 Approval card |
+| 按键 / 区域 | Dashboard 状态页 | 审批卡片 |
 | --- | --- | --- |
-| **PUSH**（中） | 触发一次重绘 | **同意 Approve** |
-| **DOWN**（下） | 切换 demo 模式 | **拒绝 Deny** |
+| **PUSH**（中） | 触发一次重绘 | **同意** |
+| **DOWN**（下） | 切换 demo 模式 | **拒绝** |
 | **UP**（上） | 短按：强制 GC16 全刷（清残影）· 长按 1.5s：切换 **DND 勿扰** | — |
-| 点会话行 Tap session row | 切换 dashboard focus 到该 session | — |
+| 点会话行 | 切换 dashboard focus 到该 session | — |
 | 点右上 `SETTINGS` | 打开设置页 | — |
 | 点选项卡片 | — | 回答 `AskUserQuestion` |
 
@@ -126,7 +128,7 @@ BLE 首次连接会触发 macOS 系统配对对话框，Paper 屏幕上显示 6 
 
 ---
 
-## 💰 上下文预算 · Context budget
+## 💰 上下文预算
 
 屏幕上的进度条显示 **当前 focus 的 session 的上下文窗口占用量** ÷ 上限，读取自 session transcript JSONL 里最后一条 assistant 消息的 `usage.input_tokens + output_tokens`。
 
@@ -140,13 +142,13 @@ BUDDY_BUDGET=1000000 /buddy-start
 
 ---
 
-## 🌐 语言切换 · Language
+## 🌐 语言切换
 
 默认英文。点 `SETTINGS` → 第一行 **language / 语言** → 切换到中文。选择写入 NVS，重启保留。
 
 ---
 
-## 📂 目录结构 · Layout
+## 📂 目录结构
 
 ```
 src/
@@ -171,7 +173,7 @@ tools/claude_code_bridge.py   # daemon: HTTP → serial/BLE 桥接
 
 ---
 
-## 🧩 开发 · Development
+## 🧩 开发
 
 固件改完后：
 
@@ -193,7 +195,7 @@ plugin/scripts/stop.sh && plugin/scripts/start.sh
 
 ---
 
-## 🙏 致谢 · Credits
+## 🙏 致谢
 
 本项目参考了 Anthropic 的 [`claude-desktop-buddy`](https://github.com/anthropics/claude-desktop-buddy)：
 
@@ -204,11 +206,11 @@ plugin/scripts/stop.sh && plugin/scripts/start.sh
 
 ---
 
-## 📜 协议 · License
+## 📜 协议
 
 本项目使用 **[GPL-3.0](LICENSE)** 协议，额外附加**署名要求**：
 
-> **Any fork, modification, or redistribution MUST:**
+> **任何 fork / 修改 / 再分发，都必须：**
 >
 > 1. 保留 `Copyright © 2026 op7418` 版权声明
 > 2. 在 README 或 About 里**显眼地署名** "op7418 / m5-paper-buddy"
@@ -219,7 +221,7 @@ plugin/scripts/stop.sh && plugin/scripts/start.sh
 详见 [LICENSE](LICENSE) 文件里的 "Attribution & derivative obligations" 段落。
 
 <details>
-<summary>第三方组件 Third-party components</summary>
+<summary>第三方组件</summary>
 
 - `data/cjk.ttf`：GenSenRounded Regular，来自 M5EPD 库示例，字体本身的许可条款适用于该文件
 - `src/paper/buddy_frames.h`：ASCII 帧改自 anthropics/claude-desktop-buddy（MIT）
