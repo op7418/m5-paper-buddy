@@ -1,0 +1,10 @@
+{
+  "name": "m5-paper-buddy",
+  "version": "0.2.0",
+  "description": "Claude Code companion on an M5Paper V1.1 e-ink device. Mirrors sessions, routes permission prompts + AskUserQuestion to hardware buttons / touchscreen, supports CJK, streams over USB or BLE.",
+  "author": "op7418",
+  "homepage": "https://github.com/op7418/m5-paper-buddy",
+  "commands": "./commands",
+  "hooks": "./settings/hooks.json",
+  "scripts": "./scripts"
+}

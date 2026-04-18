@@ -1,0 +1,42 @@
+{
+  "_comment": "Merge this `hooks` block into ~/.claude/settings.json (or any project .claude/settings.json). Each command POSTs the hook payload to the bridge daemon; daemon writes heartbeats to the Paper over USB serial. `|| echo '{}'` makes the hook a no-op when the daemon isn't running, so Claude Code keeps working normally.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {"type": "command", "command": "curl -sS --max-time 3 -X POST --data-binary @- http://127.0.0.1:9876/hook 2>/dev/null || echo '{}'"}
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {"type": "command", "command": "curl -sS --max-time 3 -X POST --data-binary @- http://127.0.0.1:9876/hook 2>/dev/null || echo '{}'"}
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {"type": "command", "command": "curl -sS --max-time 3 -X POST --data-binary @- http://127.0.0.1:9876/hook 2>/dev/null || echo '{}'"}
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {"type": "command", "command": "curl -sS --max-time 40 -X POST --data-binary @- http://127.0.0.1:9876/hook 2>/dev/null || echo '{}'"}
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {"type": "command", "command": "curl -sS --max-time 3 -X POST --data-binary @- http://127.0.0.1:9876/hook 2>/dev/null || echo '{}'"}
+        ]
+      }
+    ]
+  }
+}

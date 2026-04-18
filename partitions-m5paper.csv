@@ -1,0 +1,7 @@
+# Custom partitions for M5Paper V1.1 (16MB flash). Gives LittleFS ~13MB so
+# a 3.4MB CJK TTF font can live there with headroom for future assets.
+# Name,     Type, SubType,  Offset,   Size,      Flags
+nvs,        data, nvs,      0x9000,   0x5000,
+otadata,    data, ota,      0xe000,   0x2000,
+app0,       app,  factory,  0x10000,  0x300000,
+spiffs,     data, spiffs,   0x310000, 0xCE0000,
