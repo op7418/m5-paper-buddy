@@ -1,14 +1,13 @@
 #pragma once
 #include <Arduino.h>
 #include <ArduinoJson.h>
-#include <M5EPD.h>
+#include <M5Unified.h>
 #include "../ble_bridge.h"
 #include "xfer_paper.h"
 
-// Paper fork of data.h. Only change vs the Stick original: RTC API — M5EPD
-// uses rtc_time_t/rtc_date_t with lowercase field names, whereas M5StickC
-// Plus uses RTC_TimeTypeDef/RTC_DateTypeDef with capitalised ones. Wire
-// protocol parsing, demo mode, and line buffering are identical.
+// Paper fork of data.h. Uses M5Unified RTC API (m5::rtc_time_t /
+// m5::rtc_date_t). Wire protocol parsing, demo mode, and line buffering
+// are identical to the Stick original.
 
 struct TamaState {
   uint8_t  sessionsTotal;
@@ -113,17 +112,17 @@ static void _applyJson(const char* line, TamaState* out) {
   if (!t.isNull() && t.size() == 2) {
     time_t local = (time_t)t[0].as<uint32_t>() + (int32_t)t[1];
     struct tm lt; gmtime_r(&local, &lt);
-    rtc_time_t tm;
-    tm.hour = (int8_t)lt.tm_hour;
-    tm.min  = (int8_t)lt.tm_min;
-    tm.sec  = (int8_t)lt.tm_sec;
-    rtc_date_t dt;
-    dt.week = (int8_t)lt.tm_wday;
-    dt.mon  = (int8_t)(lt.tm_mon + 1);
-    dt.day  = (int8_t)lt.tm_mday;
-    dt.year = (int16_t)(lt.tm_year + 1900);
-    M5.RTC.setTime(&tm);
-    M5.RTC.setDate(&dt);
+    m5::rtc_time_t tm;
+    tm.hours   = (int8_t)lt.tm_hour;
+    tm.minutes = (int8_t)lt.tm_min;
+    tm.seconds = (int8_t)lt.tm_sec;
+    m5::rtc_date_t dt;
+    dt.weekDay = (int8_t)lt.tm_wday;
+    dt.month   = (int8_t)(lt.tm_mon + 1);
+    dt.date    = (int8_t)lt.tm_mday;
+    dt.year    = (int16_t)(lt.tm_year + 1900);
+    M5.Rtc.setTime(tm);
+    M5.Rtc.setDate(dt);
     _rtcValid = true;
     _lastLiveMs = millis();
     return;
