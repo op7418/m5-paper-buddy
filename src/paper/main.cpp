@@ -13,22 +13,21 @@
 //   PUSH (middle)  approve when prompt is up, otherwise nudge a redraw
 //   DOWN (bottom)  deny when prompt is up, otherwise toggle demo mode
 
-#include <M5EPD.h>
 #include <LittleFS.h>
+#include <M5Unified.h>
 #include <stdarg.h>
 #include <rom/rtc.h>
 #include "../ble_bridge.h"
 #include "data_paper.h"
 #include "buddy_frames.h"
 
-M5EPD_Canvas canvas(&M5.EPD);
+M5Canvas canvas(&M5.Display);
 
 static const int W = 540;
 static const int H = 960;
 
-// Text sizes — pixel heights (TTF rendering uses setTextSize as pixels,
-// not a multiplier like the built-in font does). Each gets a
-// createRender() in setup() so the glyph cache is warm for CJK.
+// Text sizes — target pixel heights. M5GFX's setTextSize is a multiplier,
+// so setTS() below picks the best built-in efontCN and applies a scale.
 static const int TS_SM   = 18;   // small body / labels
 static const int TS_MD   = 26;   // primary body text
 static const int TS_LG   = 34;   // emphasis
@@ -36,9 +35,24 @@ static const int TS_XL   = 44;   // tool name, option labels
 static const int TS_XXL  = 56;   // big headline
 static const int TS_HUGE = 72;   // passkey digits / splash
 
-static const uint16_t INK      = 15;
-static const uint16_t INK_DIM  = 13;
-static const uint16_t PAPER    = 0;
+// Map a target pixel height to the best available efontCN + scale factor.
+// efontCN built-in sizes: 10, 12, 14, 16, 24 pixels.
+static void setTS(int px) {
+  if (px <= 12) {
+    canvas.setFont(&fonts::efontCN_10);
+    canvas.setTextSize((float)px / 10.0f);
+  } else if (px <= 18) {
+    canvas.setFont(&fonts::efontCN_16);
+    canvas.setTextSize((float)px / 16.0f);
+  } else {
+    canvas.setFont(&fonts::efontCN_24);
+    canvas.setTextSize((float)px / 24.0f);
+  }
+}
+
+static const uint16_t INK      = TFT_BLACK;
+static const uint16_t INK_DIM  = 0x2945;   // dark gray (~15% bright)
+static const uint16_t PAPER    = TFT_WHITE;
 
 // Section rules — use full INK + 2px thick so they're clearly visible
 // under both GC16 (where grayscales differ) and DU (where everything
@@ -250,7 +264,7 @@ static void drawBuddy(int cx, int cy, BuddyState state) {
   const int totalH = 5 * lineH;
   int x0 = cx - totalW / 2;
   int y0 = cy - totalH / 2;
-  canvas.setTextSize(TS_MD);
+  setTS(TS_MD);
   canvas.setTextColor(INK);
   canvas.setTextDatum(TC_DATUM);
   for (int i = 0; i < 5; i++) {
@@ -294,11 +308,11 @@ static uint8_t sessionRectCount = 0;
 
 static void drawHeader() {
   canvas.setTextDatum(TL_DATUM);          // defensive reset every frame
-  canvas.setTextSize(TS_MD);
+  setTS(TS_MD);
   canvas.setTextColor(INK);
   canvas.drawString(LX("Paper Buddy", "Paper Buddy"), 24, 22);
 
-  canvas.setTextSize(TS_SM);
+  setTS(TS_SM);
   canvas.setTextColor(INK_DIM);
   char who[64];
   if (ownerName()[0]) snprintf(who, sizeof(who), "%s's %s", ownerName(), petName());
@@ -307,17 +321,17 @@ static void drawHeader() {
 
   // Battery on line 1 (top-right, aligned with "Paper Buddy"), SETTINGS
   // as plain text on line 2 (aligned with owner). No chip, no box.
-  uint32_t vBat = M5.getBatteryVoltage();
+  int32_t vBat = M5.Power.getBatteryVoltage();
   int pct = ((int)vBat - 3200) * 100 / (4350 - 3200);
   if (pct < 0) pct = 0; if (pct > 100) pct = 100;
   char bat[16]; snprintf(bat, sizeof(bat), "%d%%", pct);
 
-  canvas.setTextSize(TS_SM);
+  setTS(TS_SM);
   canvas.setTextColor(INK_DIM);
   canvas.setTextDatum(TR_DATUM);
   canvas.drawString(bat, W - 24, 26);
 
-  canvas.setTextSize(TS_SM);
+  setTS(TS_SM);
   canvas.setTextColor(INK);
   canvas.drawString(LX("SETTINGS", "设置"), W - 24, 60);
 
@@ -327,7 +341,7 @@ static void drawHeader() {
 
   // DND badge sits to the left of SETTINGS on the same line.
   if (dndMode) {
-    canvas.setTextSize(TS_SM);
+    setTS(TS_SM);
     int dndW = 60, dndH = 30;
     int dx = W - 160 - 10 - dndW, dy = 50;
     canvas.fillRect(dx, dy, dndW, dndH, INK);
@@ -348,7 +362,7 @@ static void drawTopBand() {
 
   // --- LEFT: session list (2+) OR classic single-project view ---------
   int lx = 16, ly = 108;
-  canvas.setTextSize(TS_SM);
+  setTS(TS_SM);
   canvas.setTextColor(INK_DIM);
   canvas.drawString(tama.sessionCount > 1 ? LX("SESSIONS", "会话") : LX("PROJECT", "项目"), lx, ly);
   ly += 22;
@@ -359,7 +373,7 @@ static void drawTopBand() {
     // a prefix marker: "!" = waiting on approval, "*" = running,
     // "." = idle. Project name on left, branch info on right.
     sessionRectCount = 0;
-    canvas.setTextSize(TS_SM);
+    setTS(TS_SM);
     int rowH = 26;
     for (uint8_t i = 0; i < tama.sessionCount && ly < 254; i++) {
       const auto& s = tama.sessions[i];
@@ -390,11 +404,11 @@ static void drawTopBand() {
     }
   } else {
     sessionRectCount = 0;
-    canvas.setTextSize(TS_MD);
+    setTS(TS_MD);
     canvas.setTextColor(INK);
     drawTrunc(tama.project[0] ? tama.project : "-", lx, ly, 14);
     ly += 34;
-    canvas.setTextSize(TS_SM);
+    setTS(TS_SM);
     canvas.setTextColor(INK_DIM);
     if (tama.branch[0]) {
       char bra[48];
@@ -403,10 +417,10 @@ static void drawTopBand() {
       drawTrunc(bra, lx, ly, 20);
     }
     ly = 200;
-    canvas.setTextSize(TS_SM);
+    setTS(TS_SM);
     canvas.setTextColor(INK_DIM);
     canvas.drawString(LX("SESSIONS", "会话"), lx, ly); ly += 22;
-    canvas.setTextSize(TS_MD);
+    setTS(TS_MD);
     canvas.setTextColor(INK);
     if (!tama.connected) {
       canvas.drawString("-", lx, ly);
@@ -422,20 +436,20 @@ static void drawTopBand() {
 
   // --- RIGHT: model + budget --------------------------------------------
   int rx = W/2 + 16, ry = 108;
-  canvas.setTextSize(TS_SM);
+  setTS(TS_SM);
   canvas.setTextColor(INK_DIM);
   canvas.drawString(LX("MODEL", "模型"), rx, ry);  ry += 22;
-  canvas.setTextSize(TS_MD);
+  setTS(TS_MD);
   canvas.setTextColor(INK);
   // No em dash fallback — an empty model field just leaves the slot
   // blank rather than rendering a single-glyph that can look like a
   // stray line next to the column divider.
   if (tama.modelName[0]) drawTrunc(tama.modelName, rx, ry, 14);
   ry = 188;
-  canvas.setTextSize(TS_SM);
+  setTS(TS_SM);
   canvas.setTextColor(INK_DIM);
   canvas.drawString(LX("CONTEXT", "上下文"), rx, ry); ry += 22;
-  canvas.setTextSize(TS_SM);
+  setTS(TS_SM);
   canvas.setTextColor(INK);
   char tok[16]; fmtTokens(tok, sizeof(tok), tama.tokensToday);
   if (tama.budgetLimit > 0) {
@@ -464,10 +478,10 @@ static void drawStats() {
   int y = 280;
 
   auto drawCell = [&](int x, const char* label, const char* value) {
-    canvas.setTextSize(TS_SM);
+    setTS(TS_SM);
     canvas.setTextColor(INK_DIM);
     canvas.drawString(label, x, y);
-    canvas.setTextSize(TS_MD);
+    setTS(TS_MD);
     canvas.setTextColor(INK);
     canvas.drawString(value, x, y + 22);
   };
@@ -489,11 +503,11 @@ static void drawStats() {
 // calls), so you can glance at the Paper and know what Claude is up to.
 static void drawClaudeSays() {
   int y = 338;
-  canvas.setTextSize(TS_SM);
+  setTS(TS_SM);
   canvas.setTextColor(INK_DIM);
   canvas.drawString(LX("LATEST REPLY", "最新回复"), 16, y); y += 24;
 
-  canvas.setTextSize(TS_MD);
+  setTS(TS_MD);
   canvas.setTextColor(INK);
   if (!tama.assistantMsg[0]) {
     canvas.setTextColor(INK_DIM);
@@ -516,11 +530,11 @@ static void drawClaudeSays() {
 static void drawActivity() {
   canvas.setTextDatum(TL_DATUM);
   int y = 522;
-  canvas.setTextSize(TS_SM);
+  setTS(TS_SM);
   canvas.setTextColor(INK_DIM);
   canvas.drawString(LX("ACTIVITY", "活动"), 16, y); y += 32;
 
-  canvas.setTextSize(TS_MD);
+  setTS(TS_MD);
   if (tama.nLines == 0) {
     canvas.setTextColor(INK_DIM);
     canvas.drawString("-", 16, y);
@@ -550,7 +564,7 @@ static void drawFooter() {
   drawBuddy(120, top + 80, currentBuddy());
 
   // Right column: link state + button legend.
-  canvas.setTextSize(TS_SM);
+  setTS(TS_SM);
   int rx = 254;
   int ry = top + 16;
   bool linked = bleConnected() && dataBtActive();
@@ -568,10 +582,10 @@ static void drawFooter() {
 }
 
 static void drawSettings() {
-  canvas.fillCanvas(PAPER);
+  canvas.fillSprite(PAPER);
   canvas.setTextDatum(TC_DATUM);
 
-  canvas.setTextSize(TS_LG);
+  setTS(TS_LG);
   canvas.setTextColor(INK);
   canvas.drawString(LX("SETTINGS", "设置"), W / 2, 30);
 
@@ -582,10 +596,10 @@ static void drawSettings() {
   int lx = 30, vx = 240;
 
   auto row = [&](const char* label, const char* value) {
-    canvas.setTextSize(TS_SM);
+    setTS(TS_SM);
     canvas.setTextColor(INK_DIM);
     canvas.drawString(label, lx, y);
-    canvas.setTextSize(TS_MD);
+    setTS(TS_MD);
     canvas.setTextColor(INK);
     canvas.drawString(value, vx, y);
     y += 50;
@@ -595,10 +609,10 @@ static void drawSettings() {
   // the value area cycles to the other language and persists.
   {
     int langY = y;
-    canvas.setTextSize(TS_SM);
+    setTS(TS_SM);
     canvas.setTextColor(INK_DIM);
     canvas.drawString(LX("language", "语言"), lx, y);
-    canvas.setTextSize(TS_MD);
+    setTS(TS_MD);
     canvas.setTextColor(INK);
     canvas.drawString(uiLang == 1 ? "中文  >  English" : "English  >  中文", vx, y);
     // Hit region covers the whole row so tapping anywhere on the line works.
@@ -620,7 +634,7 @@ static void drawSettings() {
 
   row(LX("device", "设备"), btName);
 
-  uint32_t vBat = M5.getBatteryVoltage();
+  int32_t vBat = M5.Power.getBatteryVoltage();
   int pct = ((int)vBat - 3200) * 100 / (4350 - 3200);
   if (pct < 0) pct = 0; if (pct > 100) pct = 100;
   snprintf(buf, sizeof(buf), "%d%%  (%lu mV)", pct, (unsigned long)vBat);
@@ -651,7 +665,7 @@ static void drawSettings() {
   // Tips
   drawRule(y + 10);
   y += 40;
-  canvas.setTextSize(TS_SM);
+  setTS(TS_SM);
   canvas.setTextColor(INK_DIM);
   canvas.drawString(LX("TIPS", "提示"), lx, y); y += 32;
   canvas.setTextColor(INK);
@@ -667,7 +681,7 @@ static void drawSettings() {
   for (int d = 0; d < 3; d++)
     canvas.drawRect(bx + d, by + d, bw - 2*d, bh - 2*d, INK);
   canvas.setTextDatum(MC_DATUM);
-  canvas.setTextSize(TS_LG);
+  setTS(TS_LG);
   canvas.drawString(LX("CLOSE", "关闭"), W / 2, by + bh / 2);
   canvas.setTextDatum(TL_DATUM);
 
@@ -675,7 +689,7 @@ static void drawSettings() {
 }
 
 static void drawIdle() {
-  canvas.fillCanvas(PAPER);
+  canvas.fillSprite(PAPER);
   drawHeader();
   drawTopBand();
   drawStats();
@@ -700,7 +714,7 @@ static int drawPendingTabs() {
   int tabW = (W - margin * (n + 1)) / n;
 
   canvas.setTextDatum(MC_DATUM);
-  canvas.setTextSize(TS_SM);
+  setTS(TS_SM);
   for (int i = 0; i < n; i++) {
     int tx = margin + i * (tabW + margin);
     int ty = 4;
@@ -727,13 +741,13 @@ static int drawPendingTabs() {
 static void drawPermissionCard() {
   canvas.setTextDatum(TC_DATUM);
 
-  canvas.setTextSize(TS_SM);
+  setTS(TS_SM);
   canvas.setTextColor(INK_DIM);
   canvas.drawString(dndMode ? LX("AUTO-APPROVING (DND)", "自动同意（勿扰）")
                             : LX("PERMISSION REQUESTED", "请求权限"),
                     W / 2, 20);
 
-  canvas.setTextSize(TS_LG);
+  setTS(TS_LG);
   canvas.setTextColor(INK);
   canvas.drawString(tama.promptTool[0] ? tama.promptTool : "(tool)",
                     W / 2, 56);
@@ -748,7 +762,7 @@ static void drawPermissionCard() {
       snprintf(who, sizeof(who), "%.24s", tama.promptProject);
     else
       snprintf(who, sizeof(who), "session %s", tama.promptSid);
-    canvas.setTextSize(TS_SM);
+    setTS(TS_SM);
     canvas.setTextColor(INK_DIM);
     canvas.drawString(who, W / 2, 102);
   }
@@ -759,7 +773,7 @@ static void drawPermissionCard() {
   // is significantly more readable than the previous size 2 and still
   // leaves room for ~16 lines.
   canvas.setTextDatum(TL_DATUM);
-  canvas.setTextSize(TS_MD);
+  setTS(TS_MD);
   canvas.setTextColor(INK);
   const char* src = tama.promptBody[0] ? tama.promptBody : tama.promptHint;
   if (src[0]) {
@@ -776,7 +790,7 @@ static void drawPermissionCard() {
   drawRule(770);
 
   canvas.setTextDatum(TC_DATUM);
-  canvas.setTextSize(TS_SM);
+  setTS(TS_SM);
   canvas.setTextColor(INK_DIM);
   uint32_t waited = (millis() - promptArrivedMs) / 1000;
   char wline[48]; snprintf(wline, sizeof(wline), LX("waiting %lus", "等待 %lu 秒"),
@@ -784,7 +798,7 @@ static void drawPermissionCard() {
   canvas.drawString(wline, W / 2, 790);
 
   if (responseSent) {
-    canvas.setTextSize(TS_MD);
+    setTS(TS_MD);
     canvas.setTextColor(INK_DIM);
     canvas.drawString(LX("sent - waiting for Claude...", "已发送 - 等 Claude 继续..."),
                       W / 2, 870);
@@ -795,11 +809,11 @@ static void drawPermissionCard() {
   // Side-by-side action columns at the bottom — PUSH on left, DOWN on
   // right. More compact than the stacked layout, leaves more body room.
   int cy = 870;
-  canvas.setTextSize(TS_LG);
+  setTS(TS_LG);
   canvas.setTextColor(INK);
   canvas.drawString("PUSH", W / 4, cy);
   canvas.drawString("DOWN", 3 * W / 4, cy);
-  canvas.setTextSize(TS_SM);
+  setTS(TS_SM);
   canvas.setTextColor(INK_DIM);
   canvas.drawString(LX("approve", "同意"), W / 4,     cy + 50);
   canvas.drawString(LX("deny",    "拒绝"), 3 * W / 4, cy + 50);
@@ -813,7 +827,7 @@ static void drawPermissionCard() {
 static void drawQuestionCard() {
   canvas.setTextDatum(TC_DATUM);
 
-  canvas.setTextSize(TS_SM);
+  setTS(TS_SM);
   canvas.setTextColor(INK_DIM);
   canvas.drawString(LX("QUESTION FROM CLAUDE", "Claude 提问"), W / 2, 20);
 
@@ -833,7 +847,7 @@ static void drawQuestionCard() {
   // above the options area.
   const char* src = tama.promptBody[0] ? tama.promptBody : tama.promptHint;
   canvas.setTextDatum(TL_DATUM);
-  canvas.setTextSize(TS_MD);
+  setTS(TS_MD);
   canvas.setTextColor(INK);
   int qy = 90;
   if (src[0]) {
@@ -849,7 +863,7 @@ static void drawQuestionCard() {
   optionRectCount = 0;
   if (tama.promptOptionCount == 0) {
     canvas.setTextDatum(TC_DATUM);
-    canvas.setTextSize(TS_SM);
+    setTS(TS_SM);
     canvas.setTextColor(INK_DIM);
     canvas.drawString("(no options provided)", W / 2, 500);
     canvas.setTextDatum(TL_DATUM);
@@ -877,7 +891,7 @@ static void drawQuestionCard() {
         }
         canvas.setTextColor(INK);
       }
-      canvas.setTextSize(TS_LG);
+      setTS(TS_LG);
       char line[56];
       snprintf(line, sizeof(line), "%d  %s", i + 1, tama.promptOptions[i]);
       canvas.drawString(line, W / 2, by + btnH / 2);
@@ -890,7 +904,7 @@ static void drawQuestionCard() {
 
   // Footer: waited counter + physical button hint (DOWN = cancel).
   canvas.setTextDatum(TC_DATUM);
-  canvas.setTextSize(TS_SM);
+  setTS(TS_SM);
   canvas.setTextColor(INK_DIM);
   uint32_t waited = (millis() - promptArrivedMs) / 1000;
   char wline[64]; snprintf(wline, sizeof(wline),
@@ -909,7 +923,7 @@ static void drawQuestionCard() {
 }
 
 static void drawApproval() {
-  canvas.fillCanvas(PAPER);
+  canvas.fillSprite(PAPER);
   // No tabs on the approval card. Approvals FIFO out of the daemon's
   // queue; only one is shown at a time, resolving it pops the next.
   tabRectCount = 0;
@@ -919,33 +933,33 @@ static void drawApproval() {
 }
 
 static void drawSplash() {
-  canvas.fillCanvas(PAPER);
+  canvas.fillSprite(PAPER);
   canvas.setTextDatum(MC_DATUM);
-  canvas.setTextSize(TS_XXL);
+  setTS(TS_XXL);
   canvas.setTextColor(INK);
   canvas.drawString("Paper Buddy", W/2, H/2 - 160);
   canvas.setTextDatum(TL_DATUM);
   drawBuddy(W/2, H/2, B_IDLE);
   canvas.setTextDatum(MC_DATUM);
-  canvas.setTextSize(TS_MD);
+  setTS(TS_MD);
   canvas.setTextColor(INK_DIM);
   canvas.drawString("M5Paper V1.1", W/2, H/2 + 120);
-  canvas.setTextSize(TS_SM);
+  setTS(TS_SM);
   canvas.drawString(btName, W/2, H/2 + 170);
   canvas.setTextDatum(TL_DATUM);
 }
 
 static void drawPasskey() {
-  canvas.fillCanvas(PAPER);
+  canvas.fillSprite(PAPER);
   canvas.setTextDatum(TC_DATUM);
-  canvas.setTextSize(TS_MD);
+  setTS(TS_MD);
   canvas.setTextColor(INK_DIM);
   canvas.drawString(LX("BLUETOOTH PAIRING", "蓝牙配对"), W/2, 200);
-  canvas.setTextSize(TS_HUGE);
+  setTS(TS_HUGE);
   canvas.setTextColor(INK);
   char b[8]; snprintf(b, sizeof(b), "%06lu", (unsigned long)blePasskey());
   canvas.drawString(b, W/2, 340);
-  canvas.setTextSize(TS_SM);
+  setTS(TS_SM);
   canvas.setTextColor(INK_DIM);
   canvas.drawString(LX("enter this on the desktop", "在电脑上输入这个数字"), W/2, 560);
   canvas.setTextDatum(TL_DATUM);
@@ -958,8 +972,8 @@ static void drawPasskey() {
 // GL16 = 16-gray without flash — preserves TTF anti-aliasing so text
 // doesn't look muddy after many partial updates. Slightly slower than
 // DU (~450ms vs 260ms) but much cleaner for small-font content.
-static void pushFull()    { canvas.pushCanvas(0, 0, UPDATE_MODE_GC16); lastFullRefreshMs = lastPartialRefreshMs = millis(); }
-static void pushPartial() { canvas.pushCanvas(0, 0, UPDATE_MODE_GL16); lastPartialRefreshMs = millis(); }
+static void pushFull()    { M5.Display.setEpdMode(epd_mode_t::epd_quality); canvas.pushSprite(0, 0); lastFullRefreshMs = lastPartialRefreshMs = millis(); }
+static void pushPartial() { M5.Display.setEpdMode(epd_mode_t::epd_text); canvas.pushSprite(0, 0); lastPartialRefreshMs = millis(); }
 
 static void repaint(bool wantFull) {
   uint32_t pk = blePasskey();
@@ -998,7 +1012,9 @@ static void langSave() {
 }
 
 void setup() {
-  M5.begin(true, true, true, true, true);
+  Serial.begin(115200);
+  auto cfg = M5.config();
+  M5.begin(cfg);
 
   // Print the cause of the previous reset so crash loops can be debugged
   // over serial. rtc_get_reset_reason() codes:
@@ -1009,9 +1025,9 @@ void setup() {
                 (int)rtc_get_reset_reason(0), (int)rtc_get_reset_reason(1),
                 ESP.getFreeHeap());
 
-  M5.EPD.SetRotation(90);
-  M5.TP.SetRotation(90);
-  M5.EPD.Clear(true);
+  // M5Unified: rotation 0 = portrait (540x960) for IT8951 panel
+  M5.Display.setRotation(0);
+  M5.Display.clear(TFT_WHITE);
 
   if (!LittleFS.begin(true)) {
     Serial.println("[fs] LittleFS mount failed — continuing without it");
@@ -1030,20 +1046,10 @@ void setup() {
     }
   }
 
-  canvas.createCanvas(W, H);
-
-  // Load the CJK TTF from LittleFS. loadFont returns esp_err_t — ESP_OK = 0
-  // means success, so we compare instead of treating it as bool.
-  esp_err_t rc = canvas.loadFont("/cjk.ttf", LittleFS);
-  Serial.printf("[font] loadFont cjk.ttf rc=%d (%s)\n", (int)rc,
-                rc == ESP_OK ? "OK" : "FAIL");
-  if (rc == ESP_OK) {
-    // Warm a render for every size we draw at. 128-glyph cache per size
-    // keeps common CJK glyphs resident without blowing PSRAM.
-    for (int sz : { TS_SM, TS_MD, TS_LG, TS_XL, TS_XXL, TS_HUGE }) {
-      canvas.createRender(sz, 128);
-    }
-  }
+  canvas.setColorDepth(8);        // 8-bit grayscale for e-ink
+  canvas.createSprite(W, H);
+  canvas.setFont(&fonts::efontCN_24);  // default CJK font
+  Serial.println("[font] using built-in efontCN");
 
   statsLoad();
   settingsLoad();
@@ -1082,25 +1088,22 @@ void loop() {
   bool inPrompt = tama.promptId[0] && !responseSent;
   bool isQuestion = inPrompt && strcmp(tama.promptKind, "question") == 0;
 
-  // Touch input. GT911 is interrupt-driven: available() goes true on
-  // each finger-down/finger-up event. We track the latest coords while
-  // finger is pressed, then hit-test when isFingerUp() fires.
-  //
-  // Early version used getFingerNum() to detect presence — that's a
-  // latch on the last non-zero count, so it never went back to 0 after
-  // a lift. isFingerUp() is the right primitive.
-  if (M5.TP.available()) {
-    M5.TP.update();
+  // Touch input. M5Unified handles GT911 via M5.Touch — coordinates are
+  // auto-rotated to match M5.Display.setRotation(). We track the latest
+  // coords while finger is pressed, then hit-test on release.
+  {
     static int  lastX = 0, lastY = 0;
     static bool hadTouch = false;
 
-    bool up = M5.TP.isFingerUp();
-    if (!up) {
-      tp_finger_t f = M5.TP.readFinger(0);
-      lastX = f.x; lastY = f.y;
+    auto t = M5.Touch.getDetail();
+    if (t.isPressed()) {
+      if (!hadTouch) {
+        Serial.printf("[tp] down @ %d,%d\n", t.x, t.y);
+      }
+      lastX = t.x; lastY = t.y;
       hadTouch = true;
-      Serial.printf("[tp] down @ %d,%d\n", lastX, lastY);
-    } else if (hadTouch) {
+    }
+    if (hadTouch && t.wasReleased()) {
       hadTouch = false;
       Serial.printf("[tp] up   @ %d,%d  (inPrompt=%d isQ=%d opts=%u settings=%d)\n",
                     lastX, lastY, (int)inPrompt, (int)isQuestion,
@@ -1180,7 +1183,6 @@ void loop() {
         }
       }
     }
-    M5.TP.flush();
   }
 
 
@@ -1196,7 +1198,8 @@ void loop() {
     redrawPending = true;
   }
 
-  if (M5.BtnP.wasPressed()) {
+  if (M5.BtnB.wasPressed()) {
+    Serial.println("[btn] BtnB pressed");
     if (inPrompt) {
       char cmd[96];
       snprintf(cmd, sizeof(cmd), "{\"cmd\":\"permission\",\"id\":\"%s\",\"decision\":\"once\"}", tama.promptId);
@@ -1205,35 +1208,37 @@ void loop() {
       uint32_t tookS = (now - promptArrivedMs) / 1000;
       statsOnApproval(tookS);
       celebrateUntil = now + 4000;
-      redrawPending = true;
-    } else {
-      redrawPending = true;
     }
+    lastPartialRefreshMs = 0;
+    redrawPending = true;
   }
 
-  if (M5.BtnR.wasPressed()) {
+  if (M5.BtnC.wasPressed()) {
+    Serial.println("[btn] BtnC pressed");
     if (inPrompt) {
       char cmd[96];
       snprintf(cmd, sizeof(cmd), "{\"cmd\":\"permission\",\"id\":\"%s\",\"decision\":\"deny\"}", tama.promptId);
       sendCmd(cmd);
       responseSent = true;
       statsOnDenial();
-      redrawPending = true;
     } else {
       dataSetDemo(!dataDemo());
-      redrawPending = true;
     }
+    lastPartialRefreshMs = 0;
+    redrawPending = true;
   }
 
   static bool upLongFired = false;
-  if (M5.BtnL.pressedFor(1500) && !upLongFired && !inPrompt) {
+  if (M5.BtnA.pressedFor(1500) && !upLongFired && !inPrompt) {
+    Serial.println("[btn] BtnA long press");
     upLongFired = true;
     dndMode = !dndMode;
     dndSave();
     lastFullRefreshMs = 0;
     redrawPending = true;
   }
-  if (M5.BtnL.wasReleased()) {
+  if (M5.BtnA.wasReleased()) {
+    Serial.println("[btn] BtnA released");
     if (!upLongFired && !inPrompt) {
       lastFullRefreshMs = 0;
       redrawPending = true;

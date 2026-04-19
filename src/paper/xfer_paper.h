@@ -2,7 +2,7 @@
 #include <Arduino.h>
 #include <LittleFS.h>
 #include <ArduinoJson.h>
-#include <M5EPD.h>
+#include <M5Unified.h>
 #include "../ble_bridge.h"
 
 // Paper fork of xfer.h. Dropped vs the Stick original:
@@ -13,7 +13,7 @@
 //   - species cmd — no ASCII pets on the Paper build.
 //
 // Kept: name, owner, unpair, status. Status reports battery via
-// M5.getBatteryVoltage() instead of the Stick's AXP192 reads.
+// M5.Power.getBatteryVoltage() (M5Unified) instead of the Stick's AXP192.
 
 static void _xAck(const char* what, bool ok, uint32_t n = 0) {
   char b[64];
@@ -53,14 +53,14 @@ inline bool xferCommand(JsonDocument& doc) {
   }
 
   if (strcmp(cmd, "status") == 0) {
-    // M5Paper: battery is read straight off the ADC, no PMIC. 3.2V = empty,
-    // 4.35V = full (per the M5EPD examples). No charge current exposed, so
-    // we approximate usb/charging from the raw USB-in voltage.
-    uint32_t vBat_mV = M5.getBatteryVoltage();
+    // M5Paper: battery voltage via M5Unified Power API. 3.2V = empty,
+    // 4.35V = full. No charge current exposed, so we approximate
+    // usb/charging from the raw USB-in voltage.
+    int32_t vBat_mV = M5.Power.getBatteryVoltage();
     int vBat = (int)vBat_mV;
     int pct = ((int)vBat - 3200) * 100 / (4350 - 3200);
     if (pct < 0) pct = 0; if (pct > 100) pct = 100;
-    // M5EPD doesn't expose VBUS directly; treat "bat voltage > 4.25V" as
+    // M5Paper doesn't expose VBUS directly; treat "bat voltage > 4.25V" as
     // a proxy for USB-connected. Good enough for the desktop's battery pill.
     bool usb = vBat_mV > 4250;
     char b[320];
