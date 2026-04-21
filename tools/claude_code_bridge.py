@@ -36,10 +36,14 @@ import asyncio
 import glob
 import json
 import os
+import hashlib
+import base64
+import struct as _struct
 import subprocess
 import sys
 import threading
 import time
+import queue
 from collections import deque
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -70,9 +74,18 @@ BUDGET_LIMIT        = 0
 MODEL_NAME          = ""
 ASSISTANT_MSG       = ""                # global fallback when no session is focused
 SESSION_ASSISTANT   = {}                # sid -> latest assistant text (per-session)
+SESSION_TRANSCRIPTS = {}                # sid -> deque(maxlen=50) of {role,text,time}
+SESSION_STOPPED_AT  = {}                # sid -> timestamp when Stop hook fired
 FOCUSED_SID         = None              # user-picked focused session (for dashboard)
 TRANSPORT           = None
 BUMP_EVENT          = threading.Event()
+
+# WebSocket clients for web buddy
+WS_CLIENTS  = []           # list of {"send_queue": queue.Queue}
+WS_LOCK     = threading.Lock()
+WS_ACTIVE_SOCKETS = set()  # sockets owned by WS threads — server must not close
+
+SERVED_HTML = ""           # loaded from web_buddy.html at startup
 
 
 def log(*a, **kw):
@@ -243,10 +256,192 @@ class BLETransport(Transport):
 
 
 # -----------------------------------------------------------------------------
+# WebSocket helpers (RFC 6455) — zero external dependencies.
+# -----------------------------------------------------------------------------
+
+WS_GUID = "258EAFA5-E914-47DA-95CA-5AB5ABE7E1D9"
+
+
+def ws_accept_key(key: str) -> str:
+    return base64.b64encode(
+        hashlib.sha1((key + WS_GUID).encode()).digest()
+    ).decode()
+
+
+def ws_encode(data: bytes, opcode: int = 1) -> bytes:
+    """Encode a WebSocket frame (server → client, no mask)."""
+    frame = bytearray()
+    frame.append(0x80 | opcode)          # FIN + opcode
+    length = len(data)
+    if length < 126:
+        frame.append(length)
+    elif length < 65536:
+        frame.append(126)
+        frame.extend(_struct.pack("!H", length))
+    else:
+        frame.append(127)
+        frame.extend(_struct.pack("!Q", length))
+    frame.extend(data)
+    return bytes(frame)
+
+
+def ws_decode(buf: bytearray):
+    """Try to decode one WebSocket frame from *buf*.
+    Returns (payload_bytes, opcode, bytes_consumed) or None if incomplete.
+    """
+    if len(buf) < 2:
+        return None
+    opcode = buf[0] & 0x0F
+    masked = bool(buf[1] & 0x80)
+    length = buf[1] & 0x7F
+    offset = 2
+    if length == 126:
+        if len(buf) < 4:
+            return None
+        length = _struct.unpack("!H", buf[2:4])[0]
+        offset = 4
+    elif length == 127:
+        if len(buf) < 10:
+            return None
+        length = _struct.unpack("!Q", buf[2:10])[0]
+        offset = 10
+    if masked:
+        if len(buf) < offset + 4:
+            return None
+        mask = buf[offset:offset + 4]
+        offset += 4
+    if len(buf) < offset + length:
+        return None
+    payload = bytearray(buf[offset:offset + length])
+    if masked:
+        for i in range(length):
+            payload[i] ^= mask[i % 4]
+    return (bytes(payload), opcode, offset + length)
+
+
+# -----------------------------------------------------------------------------
 # Line-based RX parsing — transport delivers bytes, we assemble JSON lines.
 # -----------------------------------------------------------------------------
 
 _rx_buf = bytearray()
+
+
+def on_json_obj(obj: dict):
+    """Handle a parsed JSON command from any source (hardware or WebSocket)."""
+    global FOCUSED_SID
+    cmd = obj.get("cmd")
+    if cmd == "permission":
+        pid = obj.get("id")
+        h = PENDING.get(pid)
+        if h:
+            h["decision"] = obj.get("decision")
+            h["event"].set()
+    elif cmd == "focus_session":
+        FOCUSED_SID = obj.get("sid") or None
+        BUMP_EVENT.set()
+        # Immediately send transcript for the focused session — don't wait
+        # for the heartbeat loop (avoids 1s+ delay on click).
+        _send_session_detail(FOCUSED_SID)
+    elif cmd == "prompt":
+        text = obj.get("text", "").strip()
+        sid = obj.get("sid", "")
+        if text and sid:
+            threading.Thread(target=_send_prompt, args=(sid, text), daemon=True).start()
+
+
+def _send_session_detail(sid: str):
+    """Immediately push the full transcript for a session to all WS clients."""
+    if not sid or sid not in SESSION_TRANSCRIPTS:
+        return
+    detail = json.dumps({
+        "session_detail": {
+            "sid": sid,
+            "transcript": list(SESSION_TRANSCRIPTS[sid]),
+        }
+    }, separators=(",", ":"), ensure_ascii=False) + "\n"
+    with WS_LOCK:
+        dead = []
+        for i, client in enumerate(WS_CLIENTS):
+            try:
+                client["send_q"].put_nowait(detail)
+            except Exception:
+                dead.append(i)
+        for i in reversed(dead):
+            WS_CLIENTS.pop(i)
+
+
+def _send_prompt(sid: str, text: str):
+    """Send a user prompt to a stopped Claude Code session via claude --continue.
+
+    Only works for sessions that have already stopped (status=done).
+    Running sessions cannot be injected into — claude locks the session file.
+    """
+    # Check if session is still running
+    if sid in SESSIONS_RUNNING:
+        log(f"[prompt] session {sid[:8]} is still running, cannot inject prompt")
+        _append_session_transcript(sid, "system", "Cannot send prompt — session is still running")
+        BUMP_EVENT.set()
+        _send_session_detail(sid)
+        return
+
+    add_transcript(f"> {text[:60]}")
+    _append_session_transcript(sid, "user", text[:2000])
+    BUMP_EVENT.set()
+    _send_session_detail(sid)
+    log(f"[prompt] sending to session {sid[:8]}: {text[:60]}")
+    try:
+        import shutil
+        claude_bin = shutil.which("claude") or "claude"
+        env = os.environ.copy()
+        if os.name == "nt" and not env.get("CLAUDE_CODE_GIT_BASH_PATH"):
+            bash = shutil.which("bash")
+            if bash:
+                fixed = bash.replace("\\usr\\bin\\", "\\bin\\")
+                if os.path.isfile(fixed):
+                    env["CLAUDE_CODE_GIT_BASH_PATH"] = fixed
+                else:
+                    env["CLAUDE_CODE_GIT_BASH_PATH"] = bash
+        meta = SESSION_META.get(sid) or {}
+        cwd = meta.get("cwd")
+        if cwd and os.path.isdir(cwd):
+            log(f"[prompt] using cwd={cwd}")
+        else:
+            cwd = None
+            log(f"[prompt] no cwd for session {sid[:8]}, using default")
+        result = subprocess.run(
+            [claude_bin, "-p", text, "--continue"],
+            capture_output=True, text=True, timeout=120,
+            encoding="utf-8", errors="replace",
+            shell=(os.name == "nt"),
+            env=env,
+            cwd=cwd,
+        )
+        if result.stdout:
+            output = result.stdout.strip()
+            log(f"[prompt] session {sid[:8]} done, output: {output[:100]}")
+            SESSION_ASSISTANT[sid] = output[:5000]
+            _append_session_transcript(sid, "assistant", output[:2000])
+            BUMP_EVENT.set()
+            _send_session_detail(sid)
+        if result.returncode != 0:
+            log(f"[prompt] exit code {result.returncode}: {result.stderr[:200]}")
+    except subprocess.TimeoutExpired:
+        log(f"[prompt] session {sid[:8]} timed out")
+    except Exception as e:
+        log(f"[prompt] failed: {e}")
+
+
+def _append_session_transcript(sid: str, role: str, text: str):
+    """Append a message to a session's per-session transcript."""
+    if not sid:
+        return
+    if sid not in SESSION_TRANSCRIPTS:
+        SESSION_TRANSCRIPTS[sid] = deque(maxlen=50)
+    SESSION_TRANSCRIPTS[sid].append({
+        "role": role,
+        "text": text,
+        "time": now_hm(),
+    })
 
 
 def on_rx_byte(b: int):
@@ -266,34 +461,30 @@ def on_rx_byte(b: int):
                 obj = json.loads(line)
             except json.JSONDecodeError:
                 return
-            cmd = obj.get("cmd")
-            if cmd == "permission":
-                pid = obj.get("id")
-                h = PENDING.get(pid)
-                if h:
-                    h["decision"] = obj.get("decision")
-                    h["event"].set()
-            elif cmd == "focus_session":
-                # Device tapped a session row on the dashboard. Switch the
-                # FOCUSED_SID so the next heartbeat sends that session's
-                # project / branch / latest-reply. Does NOT affect the
-                # pending-approval FIFO — approvals keep popping in order.
-                global FOCUSED_SID
-                FOCUSED_SID = obj.get("sid") or None
-                BUMP_EVENT.set()
+            on_json_obj(obj)
     else:
         if len(_rx_buf) < 4096:   # sanity cap; devices don't send this much anyway
             _rx_buf.append(b)
 
 
 def send_line(obj: dict):
-    if TRANSPORT is None:
-        return
     # UTF-8 goes through as-is now that the firmware loads a CJK TTF
     # and uses UTF-8-aware wrapping. (Prior revision stripped non-ASCII
     # here to work around the default font crashing on multi-byte codes.)
     data = (json.dumps(obj, separators=(",", ":"), ensure_ascii=False) + "\n").encode()
-    TRANSPORT.write(data)
+    if TRANSPORT is not None:
+        TRANSPORT.write(data)
+    # Broadcast to WebSocket clients (async queues — use put_nowait)
+    text = data.decode("utf-8", errors="replace")
+    with WS_LOCK:
+        dead = []
+        for i, client in enumerate(WS_CLIENTS):
+            try:
+                client["send_q"].put_nowait(text)
+            except Exception:
+                dead.append(i)
+        for i in reversed(dead):
+            WS_CLIENTS.pop(i)
 
 
 # -----------------------------------------------------------------------------
@@ -418,6 +609,8 @@ def build_heartbeat() -> dict:
         hb = {
             "total":        len(SESSIONS_TOTAL),
             "running":      len(SESSIONS_RUNNING),
+            "idle":         len(SESSIONS_RUNNING) == 0,
+            "last_event":   TRANSCRIPT[0][:80] if TRANSCRIPT else "",
             "waiting":      len(SESSIONS_WAITING),
             "msg":          msg[:23],
             "entries":      list(TRANSCRIPT),
@@ -448,21 +641,26 @@ def build_heartbeat() -> dict:
         # (Earlier revisions sent a `pending[]` tab strip — removed, user
         # preferred dashboard-level session switching over approval tabs.)
 
-        # sessions array: one compact entry per running session. `focused`
-        # marks which one the dashboard should render as primary. Tapping
-        # a row sends {"cmd":"focus_session","sid":...} back.
+        # sessions array: one entry per session with rich status data.
         sessions_list = []
-        for sid in list(SESSIONS_TOTAL)[:5]:
+        for sid in list(SESSIONS_TOTAL):
             meta = SESSION_META.get(sid) or {}
+            is_running = sid in SESSIONS_RUNNING
+            is_waiting = sid in SESSIONS_WAITING
+            stopped = SESSION_STOPPED_AT.get(sid)
+            status = "waiting" if is_waiting else ("working" if is_running else "done")
             sessions_list.append({
-                "sid":     sid[:8],
-                "full":    sid,
-                "proj":    (meta.get("project", "") or "")[:22],
-                "branch":  (meta.get("branch", "") or "")[:16],
-                "dirty":   meta.get("dirty", 0),
-                "running": sid in SESSIONS_RUNNING,
-                "waiting": sid in SESSIONS_WAITING,
-                "focused": sid == FOCUSED_SID,
+                "sid":        sid[:8],
+                "full":       sid,
+                "proj":       (meta.get("project", "") or "")[:22],
+                "branch":     (meta.get("branch", "") or "")[:16],
+                "dirty":      meta.get("dirty", 0),
+                "status":     status,
+                "model":      SESSION_MODEL.get(sid, ""),
+                "latest":     SESSION_ASSISTANT.get(sid, "")[:100],
+                "tokens":     SESSION_CONTEXT.get(sid, 0),
+                "stopped_at": stopped,
+                "focused":    sid == FOCUSED_SID,
             })
         if sessions_list:
             hb["sessions"] = sessions_list
@@ -505,6 +703,14 @@ def build_heartbeat() -> dict:
         a_msg = SESSION_ASSISTANT.get(sid) if sid else None
         if a_msg:   hb["assistant_msg"] = a_msg
         elif ASSISTANT_MSG: hb["assistant_msg"] = ASSISTANT_MSG
+
+        # Send full transcript for the focused session
+        detail_sid = FOCUSED_SID or sid
+        if detail_sid and detail_sid in SESSION_TRANSCRIPTS:
+            hb["session_detail"] = {
+                "sid": detail_sid,
+                "transcript": list(SESSION_TRANSCRIPTS[detail_sid]),
+            }
     return hb
 
 
@@ -646,7 +852,7 @@ def extract_last_assistant(path: str) -> str:
                         if text: break
             text = (text or "").strip()
             if text:
-                return " ".join(text.split())[:220]
+                return text[:5000]
     except Exception as e:
         log(f"[transcript] error: {e}")
     return ""
@@ -658,6 +864,48 @@ def extract_last_assistant(path: str) -> str:
 
 class HookHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args): pass
+
+    def do_GET(self):
+        path = self.path.split("?")[0]
+        if path == "/":
+            self._serve_html()
+        elif path == "/manifest.json":
+            self._serve_manifest()
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def _serve_html(self):
+        body = SERVED_HTML.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        try: self.wfile.write(body)
+        except BrokenPipeError: pass
+
+    def _serve_manifest(self):
+        manifest = json.dumps({
+            "name": "Paper Buddy",
+            "short_name": "Buddy",
+            "start_url": "/",
+            "display": "standalone",
+            "orientation": "portrait",
+            "background_color": "#ffffff",
+            "theme_color": "#ffffff",
+            "icons": [{
+                "src": "data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📟</text></svg>",
+                "sizes": "192x192",
+                "type": "image/svg+xml",
+            }],
+        })
+        body = manifest.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        try: self.wfile.write(body)
+        except BrokenPipeError: pass
 
     def do_POST(self):
         try:
@@ -672,6 +920,16 @@ class HookHandler(BaseHTTPRequestHandler):
 
         sid = payload.get("session_id", "")
         cwd = payload.get("cwd", "")
+        # Auto-register sessions that started before the daemon
+        if sid and sid not in SESSIONS_TOTAL:
+            with STATE_LOCK:
+                SESSIONS_TOTAL.add(sid)
+                if sid not in SESSION_TRANSCRIPTS:
+                    SESSION_TRANSCRIPTS[sid] = deque(maxlen=50)
+            if event not in ("SessionStart", "Stop"):
+                with STATE_LOCK:
+                    SESSIONS_RUNNING.add(sid)
+            log(f"[hook] auto-registered session {sid[:8]}")
         if sid and cwd:
             refresh_git(sid, cwd)
 
@@ -683,25 +941,19 @@ class HookHandler(BaseHTTPRequestHandler):
 
         tp = payload.get("transcript_path")
         if isinstance(tp, str) and tp:
-            # Model comes from the transcript's assistant messages, not
-            # from the hook payload itself.
             if sid:
                 m = extract_session_model(tp)
                 if m:
                     SESSION_MODEL[sid] = short_model(m)
             latest = extract_last_assistant(tp)
             if latest:
-                # Per-session cache so the focused session's reply is what
-                # gets displayed. Also refresh the global fallback.
                 if sid and SESSION_ASSISTANT.get(sid) != latest:
                     SESSION_ASSISTANT[sid] = latest
+                    _append_session_transcript(sid, "assistant", latest)
                     BUMP_EVENT.set()
                 if latest != ASSISTANT_MSG:
                     ASSISTANT_MSG = latest
                     BUMP_EVENT.set()
-            # Current-turn context usage for this session. Heartbeat uses
-            # the FOCUSED session's value so the user sees how full that
-            # window is, not an unrelated cross-session sum.
             if sid:
                 ctx = extract_session_context(tp)
                 if SESSION_CONTEXT.get(sid) != ctx:
@@ -733,8 +985,11 @@ class HookHandler(BaseHTTPRequestHandler):
         sid = p.get("session_id", "")
         with STATE_LOCK:
             SESSIONS_TOTAL.add(sid); SESSIONS_RUNNING.add(sid)
+            if sid not in SESSION_TRANSCRIPTS:
+                SESSION_TRANSCRIPTS[sid] = deque(maxlen=50)
         proj = (SESSION_META.get(sid) or {}).get("project", "")
         add_transcript(f"session: {proj}" if proj else "session started")
+        _append_session_transcript(sid, "system", f"session started" + (f": {proj}" if proj else ""))
         BUMP_EVENT.set()
         return {}
 
@@ -742,18 +997,33 @@ class HookHandler(BaseHTTPRequestHandler):
         sid = p.get("session_id", "")
         with STATE_LOCK:
             SESSIONS_RUNNING.discard(sid)
-        add_transcript("session done"); BUMP_EVENT.set()
+        SESSION_STOPPED_AT[sid] = time.time()
+        add_transcript("session done")
+        _append_session_transcript(sid, "system", "session done — waiting for input")
+        BUMP_EVENT.set()
         return {}
 
     def _user_prompt(self, p):
         prompt = (p.get("prompt") or "").strip().replace("\n", " ")
+        sid = p.get("session_id", "")
         if prompt:
-            add_transcript(f"> {prompt[:60]}"); BUMP_EVENT.set()
+            # Skip if _send_prompt already added this exact message (avoid duplicate)
+            dq = SESSION_TRANSCRIPTS.get(sid)
+            if dq:
+                last = dq[-1] if dq else {}
+                if last.get("role") == "user" and last.get("text","")[:200] == prompt[:200]:
+                    return {}
+            add_transcript(f"> {prompt[:60]}")
+            _append_session_transcript(sid, "user", prompt[:200])
+            BUMP_EVENT.set()
         return {}
 
     def _posttool(self, p):
         tool = p.get("tool_name", "?")
-        add_transcript(f"{tool} done"); BUMP_EVENT.set()
+        sid = p.get("session_id", "")
+        add_transcript(f"{tool} done")
+        _append_session_transcript(sid, "system", f"{tool} done")
+        BUMP_EVENT.set()
         return {}
 
     def _pretool(self, p):
@@ -762,11 +1032,6 @@ class HookHandler(BaseHTTPRequestHandler):
         tool = p.get("tool_name", "?")
         tin  = p.get("tool_input") or {}
 
-        # Sessions running with --dangerously-skip-permissions (or the
-        # equivalent in-session toggle) already opted out of permission
-        # prompts. Mirror that here — don't block the hook for 30s on
-        # every tool call just to show a card Claude Code would ignore.
-        # Still emit a short transcript line so the Paper shows activity.
         if p.get("permission_mode") == "bypassPermissions":
             add_transcript(f"{tool} (bypass)")
             BUMP_EVENT.set()
@@ -774,6 +1039,17 @@ class HookHandler(BaseHTTPRequestHandler):
                 "hookEventName": "PreToolUse",
                 "permissionDecision": "allow",
                 "permissionDecisionReason": "bypass-permissions mode",
+            }}
+
+        # Auto-approve all tools except AskUserQuestion — the web buddy
+        # is a notification hub, not an approval gate.
+        if tool != "AskUserQuestion":
+            add_transcript(f"{tool}")
+            BUMP_EVENT.set()
+            return {"hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "allow",
+                "permissionDecisionReason": "auto-approved (web buddy)",
             }}
 
         hint = hint_from_tool(tool, tin)
@@ -804,9 +1080,6 @@ class HookHandler(BaseHTTPRequestHandler):
         with STATE_LOCK:
             SESSIONS_WAITING.add(sid)
             PENDING_PROMPTS[prompt_id] = prompt_obj
-            # FIFO: oldest pending is what's on screen. If nothing active,
-            # this new one takes the slot; otherwise it just joins the
-            # queue and gets its turn after earlier prompts resolve.
             if ACTIVE_PROMPT is None:
                 ACTIVE_PROMPT = prompt_obj
         BUMP_EVENT.set()
@@ -814,8 +1087,6 @@ class HookHandler(BaseHTTPRequestHandler):
         try:
             got = event.wait(timeout=30)
             decision = holder["decision"] if got else None
-            # Hold the card briefly after an option tap so the inverted-button
-            # feedback paints before the next heartbeat clears the prompt.
             if isinstance(decision, str) and decision.startswith("option:"):
                 time.sleep(0.6)
         finally:
@@ -824,9 +1095,6 @@ class HookHandler(BaseHTTPRequestHandler):
                 SESSIONS_WAITING.discard(sid)
                 PENDING_PROMPTS.pop(prompt_id, None)
                 if ACTIVE_PROMPT and ACTIVE_PROMPT["id"] == prompt_id:
-                    # FIFO: advance to the NEXT queued prompt (oldest
-                    # remaining = first insertion in dict). Clear back
-                    # to dashboard if none are left.
                     ACTIVE_PROMPT = next(iter(PENDING_PROMPTS.values()), None)
             BUMP_EVENT.set()
 
@@ -866,6 +1134,79 @@ class HookHandler(BaseHTTPRequestHandler):
         return {}
 
 
+class BuddyHTTPServer(HTTPServer):
+    """Plain HTTPServer — WebSocket runs on its own websockets server."""
+    pass
+
+
+async def _ws_handler_async(websocket):
+    """Async WebSocket handler called by websockets.serve()."""
+    import asyncio
+    send_q = asyncio.Queue()
+    client_info = {"send_q": send_q, "ws": websocket}
+    with WS_LOCK:
+        WS_CLIENTS.append(client_info)
+    log("[ws] client connected")
+
+    # Send handshake + initial heartbeat
+    owner = ""
+    try: owner = os.environ.get("USER", "")
+    except Exception: pass
+    if owner:
+        await send_q.put('{"cmd":"owner","name":"' + owner + '"}\n')
+    await send_q.put('{"time":[' + str(int(time.time())) + ',' + str(tz_offset_seconds()) + ']}\n')
+    await send_q.put(json.dumps(build_heartbeat(), separators=(",", ":"), ensure_ascii=False) + "\n")
+
+    async def sender():
+        """Pull from queue and send to websocket."""
+        try:
+            while True:
+                text = await send_q.get()
+                if text is None:
+                    break
+                await websocket.send(text)
+        except Exception:
+            pass
+
+    sender_task = asyncio.create_task(sender())
+
+    try:
+        async for message in websocket:
+            text = message if isinstance(message, str) else message.decode("utf-8", errors="replace")
+            for line in text.split("\n"):
+                line = line.strip()
+                if not line or not line.startswith("{"):
+                    continue
+                try:
+                    obj = json.loads(line)
+                    on_json_obj(obj)
+                except json.JSONDecodeError:
+                    pass
+    except Exception:
+        pass
+    finally:
+        sender_task.cancel()
+        with WS_LOCK:
+            try: WS_CLIENTS.remove(client_info)
+            except ValueError: pass
+        log("[ws] client disconnected")
+
+
+def _start_ws_server(port):
+    """Run the WebSocket server on its own port in a daemon thread."""
+    import websockets as _ws_lib
+    import asyncio
+
+    async def _serve():
+        async with _ws_lib.serve(_ws_handler_async, "0.0.0.0", port):
+            log(f"[ws] WebSocket server on port {port}")
+            await asyncio.Future()  # run forever
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(_serve())
+
+
 # -----------------------------------------------------------------------------
 
 def tz_offset_seconds() -> int:
@@ -898,12 +1239,16 @@ def pick_transport(kind: str) -> Transport:
 
 
 def main():
-    global BUDGET_LIMIT, TRANSPORT
+    global BUDGET_LIMIT, TRANSPORT, SERVED_HTML
 
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", help="explicit serial port (implies --transport serial)")
     ap.add_argument("--transport", choices=("auto", "serial", "ble"), default="auto")
     ap.add_argument("--http-port", type=int, default=9876)
+    ap.add_argument("--host", default=None,
+                    help="bind address (default: 127.0.0.1, 0.0.0.0 when --web)")
+    ap.add_argument("--web", action="store_true",
+                    help="enable web buddy mode (serve HTML + WebSocket)")
     ap.add_argument("--owner", default=os.environ.get("USER", ""))
     ap.add_argument("--budget", type=int, default=200000,
                     help="context-window limit for the budget bar (default 200K = "
@@ -913,25 +1258,58 @@ def main():
 
     BUDGET_LIMIT = max(0, args.budget)
 
+    # Load web frontend HTML
+    html_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web_buddy.html")
+    if os.path.exists(html_path):
+        with open(html_path, "r", encoding="utf-8") as f:
+            SERVED_HTML = f.read()
+        log(f"[web] loaded {html_path} ({len(SERVED_HTML)} bytes)")
+
+    # Transport: if --web and no explicit port/transport, skip hardware
+    use_hardware = not args.web or args.port or args.transport != "auto"
+
     if args.port:
         TRANSPORT = SerialTransport(args.port)
+    elif args.web and not args.port and args.transport == "auto":
+        # Web-only mode: no hardware transport needed
+        log("[transport] web mode, skipping hardware transport")
+        TRANSPORT = None
     else:
         TRANSPORT = pick_transport(args.transport)
 
     # Send the owner + time-sync handshake whenever we (re)connect. For
     # serial, the transport fires on_connect immediately. For BLE, it
     # fires after subscribing to TX notify so the device is ready.
-    def _handshake():
-        if args.owner:
-            send_line({"cmd": "owner", "name": args.owner})
-        send_line({"time": [int(time.time()), tz_offset_seconds()]})
-        send_line(build_heartbeat())
+    if TRANSPORT:
+        def _handshake():
+            if args.owner:
+                send_line({"cmd": "owner", "name": args.owner})
+            send_line({"time": [int(time.time()), tz_offset_seconds()]})
+            send_line(build_heartbeat())
 
-    TRANSPORT.start(on_rx_byte, on_connect=_handshake)
+        TRANSPORT.start(on_rx_byte, on_connect=_handshake)
+
     threading.Thread(target=heartbeat_loop, daemon=True).start()
 
-    srv = HTTPServer(("127.0.0.1", args.http_port), HookHandler)
-    log(f"[http] listening on 127.0.0.1:{args.http_port}  budget={BUDGET_LIMIT}")
+    host = args.host or ("0.0.0.0" if args.web else "127.0.0.1")
+    srv = BuddyHTTPServer((host, args.http_port), HookHandler)
+    log(f"[http] listening on {host}:{args.http_port}  budget={BUDGET_LIMIT}")
+
+    # Start WebSocket server on a separate port for web buddy
+    ws_port = args.http_port + 1
+    if args.web:
+        threading.Thread(target=_start_ws_server, args=(ws_port,), daemon=True).start()
+        # Show local IPs for convenience
+        try:
+            import socket as _socket
+            s = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            local_ip = s.getsockname()[0]
+            s.close()
+            log(f"[web] open http://{local_ip}:{args.http_port}/ on your device")
+            log(f"[web] WebSocket on port {ws_port}")
+        except Exception:
+            log(f"[web] open http://<your-ip>:{args.http_port}/ on your device")
     log("[ready] start a Claude Code session with the hooks installed")
     try:
         srv.serve_forever()
