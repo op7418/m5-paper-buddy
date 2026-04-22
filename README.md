@@ -79,6 +79,7 @@ cd m5-paper-buddy
 pio run -e m5paper -t uploadfs          # 刷字体进 LittleFS（~90s）
 pio run -e m5paper -t upload            # 刷固件（~30s）
 python3 tools/claude_code_bridge.py --budget 200000
+python tools/claude_code_bridge.py --web --budget 200000
 
 # 然后把 plugin/settings/hooks.json 的 hooks 块手动合并到
 # ~/.claude/settings.json
